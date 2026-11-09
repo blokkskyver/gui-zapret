@@ -67,7 +67,13 @@ func serviceCommand() (string, error) {
 	command, _, err := key.GetStringValue("ImagePath")
 	return command, err
 }
-func waitState(s *mgr.Service, desired svc.State) error {
+
+type serviceController interface {
+	Query() (svc.Status, error)
+	Control(svc.Cmd) (svc.Status, error)
+}
+
+func waitState(s serviceController, desired svc.State) error {
 	deadline := time.Now().Add(25 * time.Second)
 	for time.Now().Before(deadline) {
 		status, err := s.Query()
@@ -84,7 +90,7 @@ func waitState(s *mgr.Service, desired svc.State) error {
 	}
 	return fmt.Errorf("служба не достигла нужного состояния за 25 секунд; обновите статус")
 }
-func stop(s *mgr.Service) error {
+func stop(s serviceController) error {
 	st, err := s.Query()
 	if err != nil {
 		return err
@@ -92,8 +98,29 @@ func stop(s *mgr.Service) error {
 	if st.State == svc.Stopped {
 		return nil
 	}
-	if st.State != svc.StopPending {
-		if _, err = s.Control(svc.Stop); err != nil {
+	deadline := time.Now().Add(25 * time.Second)
+	for st.State != svc.StopPending {
+		if st.State == svc.Stopped {
+			return nil
+		}
+		if st.State != svc.StartPending {
+			_, err = s.Control(svc.Stop)
+			if err == nil {
+				break
+			}
+			if errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+				return waitState(s, svc.Stopped)
+			}
+			if !errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+				return fmt.Errorf("остановка службы: %w", err)
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("служба не принимает команду остановки; состояние %d", st.State)
+		}
+		time.Sleep(200 * time.Millisecond)
+		st, err = s.Query()
+		if err != nil {
 			return err
 		}
 	}
@@ -114,12 +141,30 @@ func ServiceAction(action, root, name string, g Game) error {
 			return err
 		}
 	}
-	m, err := mgr.Connect()
+	access := uint32(windows.SC_MANAGER_CONNECT)
+	if action == "install" {
+		access |= windows.SC_MANAGER_CREATE_SERVICE
+	}
+	h, err := windows.OpenSCManager(nil, nil, access)
 	if err != nil {
 		return err
 	}
+	m := &mgr.Mgr{Handle: h}
 	defer m.Disconnect()
-	s, err := m.OpenService("zapret")
+	rights := uint32(windows.SERVICE_QUERY_STATUS)
+	switch action {
+	case "start":
+		rights |= windows.SERVICE_START
+	case "stop":
+		rights |= windows.SERVICE_STOP
+	case "remove":
+		rights |= windows.SERVICE_STOP | windows.DELETE
+	case "install":
+		rights |= windows.SERVICE_STOP | windows.SERVICE_START | windows.SERVICE_CHANGE_CONFIG
+	}
+	serviceName, _ := windows.UTF16PtrFromString("zapret")
+	sh, err := windows.OpenService(m.Handle, serviceName, rights)
+	s := &mgr.Service{Name: "zapret", Handle: sh}
 	if action == "install" && errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		s, err = m.CreateService("zapret", filepath.Join(root, "bin", "winws.exe"), mgr.Config{DisplayName: "zapret", Description: "Zapret DPI bypass software", StartType: mgr.StartAutomatic}, args...)
 		if err != nil {

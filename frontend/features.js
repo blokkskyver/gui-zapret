@@ -1,4 +1,12 @@
 let releaseItems=[],editorOriginal='',editorName='';
+let installationOffered=false;
+function offerInstallation(){
+ if(installationOffered||state?.rootValid!==false||busy||document.querySelector('dialog[open]'))return;
+ installationOffered=true;$('installLocation').textContent='Папка по умолчанию: Документы\\zapret. Проверенный путь: '+state.root;$('installPrompt').showModal();
+}
+$('installLater').onclick=()=>$('installPrompt').close();
+$('installBrowse').onclick=()=>{$('installPrompt').close();$('browse').click()};
+$('installDownload').onclick=()=>{$('installPrompt').close();$('download').click()};
 // A small ASCII rotor follows the last observed Windows service state.
 const rotorFrames=[
  '   |   \n --O-- \n   |   ',

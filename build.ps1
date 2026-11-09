@@ -2,6 +2,10 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $env:GOMODCACHE = Join-Path $PSScriptRoot '.cache\gomod'
 $env:GOCACHE = Join-Path $PSScriptRoot '.cache\gobuild'
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    node scripts/check_frontend.cjs
+    if ($LASTEXITCODE -ne 0) { throw 'Frontend startup check failed' }
+}
 go test ./...
 if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
 New-Item -ItemType Directory -Force build\bin | Out-Null

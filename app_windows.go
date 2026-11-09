@@ -15,14 +15,18 @@ import (
 )
 
 type App struct {
-	ctx    context.Context
-	mu     sync.Mutex
-	root   string
-	logs   []string
-	config string
+	ctx          context.Context
+	mu           sync.Mutex
+	root         string
+	logs         []string
+	config       string
+	releaseMu    sync.Mutex
+	releaseCache []Release
+	releaseAt    time.Time
 }
 type Snapshot struct {
 	Root        string          `json:"root"`
+	RootValid   bool            `json:"rootValid"`
 	Strategies  []string        `json:"strategies"`
 	Game        flowseal.Game   `json:"game"`
 	Status      flowseal.Status `json:"status"`
@@ -35,8 +39,7 @@ type Snapshot struct {
 func newApp() *App { return &App{logs: []string{}} }
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
-	home, _ := os.UserHomeDir()
-	a.root = filepath.Join(home, "Desktop", "zapret")
+	a.root = defaultDistributionRoot()
 	dir, err := os.UserConfigDir()
 	if err == nil {
 		a.config = filepath.Join(dir, "gui-zapret", "config.json")
@@ -47,6 +50,8 @@ func (a *App) startup(ctx context.Context) {
 			}
 		}
 	}
+	exe, _ := os.Executable()
+	a.root = discoverDistributionRoot(a.root, filepath.Dir(exe), defaultDistributionRoot())
 	for i, arg := range os.Args {
 		if arg == "--root" && i+1 < len(os.Args) {
 			a.root = os.Args[i+1]
@@ -80,12 +85,14 @@ func (a *App) Snapshot() Snapshot {
 			s.Error += err.Error() + "; "
 		}
 	}
-	add(flowseal.ValidateRoot(a.root))
 	var err error
-	s.Strategies, err = flowseal.Strategies(a.root)
-	add(err)
-	s.Game, err = flowseal.ReadGame(a.root)
-	add(err)
+	s.RootValid = flowseal.ValidateRoot(a.root) == nil
+	if s.RootValid {
+		s.Strategies, err = flowseal.Strategies(a.root)
+		add(err)
+		s.Game, err = flowseal.ReadGame(a.root)
+		add(err)
+	}
 	s.Status, err = flowseal.ServiceStatus()
 	add(err)
 	_, err = os.Stat(filepath.Join(a.root, "utils", "check_updates.enabled"))
@@ -232,11 +239,49 @@ func (a *App) Elevate() error {
 	if e != nil {
 		return e
 	}
-	if e = shell("runas", exe, "--root "+windows.EscapeArg(a.root), filepath.Dir(exe), 1); e != nil {
+	name := fmt.Sprintf(`Local\gui-zapret-ready-%d-%d`, os.Getpid(), time.Now().UnixNano())
+	ptr, _ := windows.UTF16PtrFromString(name)
+	event, e := windows.CreateEvent(nil, 1, 0, ptr)
+	if e != nil {
 		return e
+	}
+	defer windows.CloseHandle(event)
+	if e = shell("runas", exe, "--root "+windows.EscapeArg(a.root)+" --ready-event "+windows.EscapeArg(name), filepath.Dir(exe), 1); e != nil {
+		return e
+	}
+	result, e := windows.WaitForSingleObject(event, 45000)
+	if e != nil {
+		return e
+	}
+	if result != windows.WAIT_OBJECT_0 {
+		return fmt.Errorf("окно с правами администратора не подтвердило запуск; исходное окно оставлено открытым")
 	}
 	runtime.Quit(a.ctx)
 	return nil
+}
+
+func (a *App) domReady(ctx context.Context) {
+	if !windows.GetCurrentProcessToken().IsElevated() {
+		return
+	}
+	for i, arg := range os.Args {
+		if arg == "--ready-event" && i+1 < len(os.Args) {
+			name := os.Args[i+1]
+			if !strings.HasPrefix(name, `Local\gui-zapret-ready-`) {
+				return
+			}
+			ptr, e := windows.UTF16PtrFromString(name)
+			if e != nil {
+				return
+			}
+			event, e := windows.OpenEvent(windows.EVENT_MODIFY_STATE, false, ptr)
+			if e == nil {
+				windows.SetEvent(event)
+				windows.CloseHandle(event)
+			}
+			return
+		}
+	}
 }
 func (a *App) OpenTool(tool string) error {
 	a.mu.Lock()

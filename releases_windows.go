@@ -40,17 +40,35 @@ func githubGet(ctx context.Context, url string) (*http.Response, error) {
 		return nil, e
 	}
 	if r.StatusCode != 200 {
+		limited := (r.StatusCode == 403 || r.StatusCode == 429) && r.Header.Get("X-RateLimit-Remaining") == "0"
 		r.Body.Close()
+		if limited {
+			return nil, fmt.Errorf("лимит запросов GitHub API исчерпан; повторите позже")
+		}
 		return nil, fmt.Errorf("GitHub: HTTP %d", r.StatusCode)
 	}
 	return r, nil
 }
 func (a *App) Releases() ([]Release, error) {
+	a.releaseMu.Lock()
+	defer a.releaseMu.Unlock()
+	if len(a.releaseCache) > 0 && time.Since(a.releaseAt) < 15*time.Minute {
+		return a.releaseCache, nil
+	}
 	ctx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
 	defer cancel()
 	r, e := githubGet(ctx, "https://api.github.com/repos/Flowseal/zapret-discord-youtube/releases?per_page=50")
 	if e != nil {
-		return nil, e
+		out, webErr := webReleases(ctx)
+		if webErr != nil {
+			if len(a.releaseCache) > 0 {
+				return a.releaseCache, nil
+			}
+			return nil, fmt.Errorf("список релизов: %v; резервная страница: %v", e, webErr)
+		}
+		a.releaseCache = out
+		a.releaseAt = time.Now()
+		return out, nil
 	}
 	defer r.Body.Close()
 	var releases []Release
@@ -68,6 +86,11 @@ func (a *App) Releases() ([]Release, error) {
 			}
 		}
 	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("GitHub не вернул релизов с ZIP")
+	}
+	a.releaseCache = out
+	a.releaseAt = time.Now()
 	return out, nil
 }
 func (a *App) DownloadRelease(tag string) (string, error) {
@@ -79,6 +102,12 @@ func (a *App) DownloadRelease(tag string) (string, error) {
 	var asset ReleaseAsset
 	for _, r := range releases {
 		if r.Tag == tag {
+			if len(r.Assets) == 0 {
+				r.Assets, e = webReleaseAssets(a.ctx, tag)
+				if e != nil {
+					return "", e
+				}
+			}
 			for _, v := range r.Assets {
 				if strings.HasSuffix(strings.ToLower(v.Name), ".zip") && strings.HasPrefix(v.URL, "https://github.com/Flowseal/zapret-discord-youtube/releases/download/") {
 					asset = v
@@ -95,7 +124,7 @@ func (a *App) DownloadRelease(tag string) (string, error) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	base := filepath.Join(filepath.Dir(a.config), "releases")
+	base := filepath.Join(defaultDistributionRoot(), "releases")
 	if e = os.MkdirAll(base, 0700); e != nil {
 		return "", e
 	}
@@ -147,17 +176,19 @@ func (a *App) DownloadRelease(tag string) (string, error) {
 		}
 	}
 	// Keep user lists and flags when switching distributions.
-	for _, rel := range []string{"utils/game_filter.enabled", "utils/check_updates.enabled", "lists/list-general-user.txt", "lists/list-exclude-user.txt", "lists/ipset-exclude-user.txt"} {
-		b, err := os.ReadFile(filepath.Join(a.root, rel))
-		if err == nil {
-			if e = os.WriteFile(filepath.Join(root, rel), b, 0600); e != nil {
-				return "", e
-			}
-		} else if !os.IsNotExist(err) {
-			return "", err
-		} else if rel == "utils/check_updates.enabled" {
-			if err = os.Remove(filepath.Join(root, rel)); err != nil && !os.IsNotExist(err) {
+	if flowseal.ValidateRoot(a.root) == nil {
+		for _, rel := range []string{"utils/game_filter.enabled", "utils/check_updates.enabled", "lists/list-general-user.txt", "lists/list-exclude-user.txt", "lists/ipset-exclude-user.txt"} {
+			b, err := os.ReadFile(filepath.Join(a.root, rel))
+			if err == nil {
+				if e = os.WriteFile(filepath.Join(root, rel), b, 0600); e != nil {
+					return "", e
+				}
+			} else if !os.IsNotExist(err) {
 				return "", err
+			} else if rel == "utils/check_updates.enabled" {
+				if err = os.Remove(filepath.Join(root, rel)); err != nil && !os.IsNotExist(err) {
+					return "", err
+				}
 			}
 		}
 	}
@@ -173,6 +204,9 @@ func (a *App) DownloadRelease(tag string) (string, error) {
 		return "", e
 	}
 	b, _ := json.Marshal(struct{ Root string }{target})
+	if e = os.MkdirAll(filepath.Dir(a.config), 0700); e != nil {
+		return "", e
+	}
 	if e = os.WriteFile(a.config, b, 0600); e != nil {
 		return "", e
 	}
