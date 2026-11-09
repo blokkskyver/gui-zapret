@@ -1,0 +1,12 @@
+/build/bin/
+/.cache/
+/frontend/wailsjs/
+*.syso
+*.log
+*.bak
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+__pycache__/
